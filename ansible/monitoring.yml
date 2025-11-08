@@ -1,0 +1,321 @@
+---
+- name: Configurar Prometheus y Grafana
+  hosts: all
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    prometheus_version: "2.48.0"
+    webserver_ip: "192.168.56.10"
+    prometheus_arch_map:
+      x86_64: amd64
+      amd64: amd64
+      aarch64: arm64
+      arm64: arm64
+    prometheus_arch: "{{ prometheus_arch_map.get(ansible_architecture, 'amd64') }}"
+    prometheus_archive: "prometheus-{{ prometheus_version }}.linux-{{ prometheus_arch }}"
+    
+  tasks:
+    # ============================================
+    # INSTALACIÓN DE DEPENDENCIAS
+    # ============================================
+    - name: Actualizar cache de apt
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      register: apt_update
+      retries: 3
+      delay: 10
+      until: apt_update is success
+    
+    - name: Instalar dependencias básicas
+      apt:
+        name:
+          - wget
+          - curl
+          - gnupg
+          - software-properties-common
+        state: present
+      register: apt_install
+      retries: 3
+      delay: 10
+      until: apt_install is success
+    
+    # ============================================
+    # INSTALACIÓN Y CONFIGURACIÓN DE PROMETHEUS
+    # ============================================
+    - name: Crear usuario prometheus
+      user:
+        name: prometheus
+        shell: /bin/false
+        system: yes
+        create_home: no
+        state: present
+    
+    - name: Crear directorios para Prometheus
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: prometheus
+        group: prometheus
+        mode: '0755'
+      loop:
+        - /etc/prometheus
+        - /var/lib/prometheus
+    
+    - name: Descargar Prometheus
+      get_url:
+        url: "https://github.com/prometheus/prometheus/releases/download/v{{ prometheus_version }}/{{ prometheus_archive }}.tar.gz"
+        dest: /tmp/prometheus.tar.gz
+        mode: '0644'
+        force: yes
+      register: download_prometheus
+      retries: 3
+      delay: 10
+      until: download_prometheus is success
+    
+    - name: Extraer Prometheus
+      unarchive:
+        src: /tmp/prometheus.tar.gz
+        dest: /tmp/
+        remote_src: yes
+        creates: "/tmp/{{ prometheus_archive }}"
+    
+    - name: Copiar binarios de Prometheus
+      copy:
+        src: "/tmp/{{ prometheus_archive }}/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        mode: '0755'
+        remote_src: yes
+      loop:
+        - prometheus
+        - promtool
+    
+    - name: Copiar directorios de consolas de Prometheus
+      shell: |
+        cp -r /tmp/{{ prometheus_archive }}/consoles /etc/prometheus/ 2>/dev/null || true
+        cp -r /tmp/{{ prometheus_archive }}/console_libraries /etc/prometheus/ 2>/dev/null || true
+        chown -R prometheus:prometheus /etc/prometheus
+      args:
+        creates: /etc/prometheus/consoles
+    
+    - name: Crear archivo de configuración de Prometheus
+      copy:
+        content: |
+          global:
+            scrape_interval: 15s
+            evaluation_interval: 15s
+            external_labels:
+              monitor: 'dataexplorer'
+          
+          scrape_configs:
+            - job_name: 'prometheus'
+              static_configs:
+                - targets: ['localhost:9090']
+            
+            - job_name: 'node_exporter'
+              static_configs:
+                - targets: ['{{ webserver_ip }}:9100']
+              metrics_path: /metrics
+            
+            - job_name: 'nginx'
+              static_configs:
+                - targets: ['{{ webserver_ip }}:80']
+              metrics_path: /nginx_status
+        dest: /etc/prometheus/prometheus.yml
+        owner: prometheus
+        group: prometheus
+        mode: '0644'
+    
+    - name: Validar configuración de Prometheus
+      command: /usr/local/bin/promtool check config /etc/prometheus/prometheus.yml
+      register: prometheus_check
+      changed_when: false
+    
+    - name: Mostrar resultado de validación
+      debug:
+        var: prometheus_check.stdout_lines
+    
+    - name: Crear servicio systemd para Prometheus
+      copy:
+        content: |
+          [Unit]
+          Description=Prometheus Monitoring System
+          Documentation=https://prometheus.io/docs/introduction/overview/
+          Wants=network-online.target
+          After=network-online.target
+          
+          [Service]
+          Type=simple
+          User=prometheus
+          Group=prometheus
+          ExecStart=/usr/local/bin/prometheus \
+            --config.file=/etc/prometheus/prometheus.yml \
+            --storage.tsdb.path=/var/lib/prometheus/ \
+            --web.console.templates=/etc/prometheus/consoles \
+            --web.console.libraries=/etc/prometheus/console_libraries \
+            --web.listen-address=0.0.0.0:9090
+          
+          Restart=always
+          RestartSec=5
+          
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/prometheus.service
+        mode: '0644'
+    
+    - name: Recargar systemd
+      systemd:
+        daemon_reload: yes
+    
+    - name: Iniciar y habilitar Prometheus
+      systemd:
+        name: prometheus
+        state: started
+        enabled: yes
+    
+    - name: Esperar a que Prometheus esté disponible
+      wait_for:
+        port: 9090
+        delay: 5
+        timeout: 60
+    
+    - name: Verificar que Prometheus responde
+      uri:
+        url: http://localhost:9090/-/healthy
+        method: GET
+        status_code: 200
+      register: prometheus_health
+      retries: 5
+      delay: 5
+      until: prometheus_health.status == 200
+    
+    # ============================================
+    # INSTALACIÓN Y CONFIGURACIÓN DE GRAFANA
+    # ============================================
+    - name: Agregar clave GPG de Grafana
+      apt_key:
+        url: https://apt.grafana.com/gpg.key
+        state: present
+      register: grafana_key
+      retries: 3
+      delay: 10
+      until: grafana_key is success
+    
+    - name: Agregar repositorio de Grafana
+      apt_repository:
+        repo: "deb https://apt.grafana.com stable main"
+        state: present
+        filename: grafana
+    
+    - name: Actualizar cache después de agregar repositorio
+      apt:
+        update_cache: yes
+    
+    - name: Instalar Grafana
+      apt:
+        name: grafana
+        state: present
+      register: grafana_install
+      retries: 3
+      delay: 10
+      until: grafana_install is success
+    
+    - name: Configurar Grafana
+      lineinfile:
+        path: /etc/grafana/grafana.ini
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        state: present
+      loop:
+        - { regexp: '^;?http_addr =', line: 'http_addr = 0.0.0.0' }
+        - { regexp: '^;?http_port =', line: 'http_port = 3000' }
+      notify: Reiniciar Grafana
+    
+    - name: Iniciar y habilitar Grafana
+      systemd:
+        name: grafana-server
+        state: started
+        enabled: yes
+    
+    - name: Esperar a que Grafana esté disponible
+      wait_for:
+        port: 3000
+        delay: 10
+        timeout: 120
+    
+    - name: Verificar que Grafana responde
+      uri:
+        url: http://localhost:3000/api/health
+        method: GET
+        status_code: 200
+      register: grafana_health
+      retries: 10
+      delay: 5
+      until: grafana_health.status == 200
+    
+    # ============================================
+    # CONFIGURACIÓN AUTOMÁTICA DE DATASOURCE
+    # ============================================
+    - name: Configurar datasource de Prometheus en Grafana
+      uri:
+        url: http://localhost:3000/api/datasources
+        method: POST
+        user: admin
+        password: admin
+        force_basic_auth: yes
+        body_format: json
+        body:
+          name: "Prometheus"
+          type: "prometheus"
+          url: "http://localhost:9090"
+          access: "proxy"
+          isDefault: true
+        status_code: [200, 201, 409]
+      register: datasource_result
+      ignore_errors: yes
+    
+    - name: Limpiar archivos temporales
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/prometheus.tar.gz
+        - "/tmp/{{ prometheus_archive }}"
+    
+    # ============================================
+    # INFORMACIÓN FINAL
+    # ============================================
+    - name: Mostrar información de acceso
+      debug:
+        msg:
+          - "=========================================="
+          - "  SISTEMA DE MONITOREO CONFIGURADO       "
+          - "=========================================="
+          - ""
+          - "✓ Prometheus: http://localhost:9090"
+          - "  - IP interna: http://192.168.56.11:9090"
+          - "  - Status: {{ 'OK' if prometheus_health.status == 200 else 'ERROR' }}"
+          - ""
+          - "✓ Grafana: http://localhost:3000"
+          - "  - IP interna: http://192.168.56.11:3000"
+          - "  - Usuario: admin"
+          - "  - Contraseña: admin"
+          - "  - Status: {{ 'OK' if grafana_health.status == 200 else 'ERROR' }}"
+          - ""
+          - "✓ Datasource Prometheus configurado automáticamente"
+          - ""
+          - "Targets monitoreados:"
+          - "  - Prometheus (localhost:9090)"
+          - "  - Node Exporter ({{ webserver_ip }}:9100)"
+          - "  - Nginx Status ({{ webserver_ip }}:80)"
+          - ""
+          - "=========================================="
+          - "  Accede a Grafana y crea tu dashboard    "
+          - "=========================================="
+  
+  handlers:
+    - name: Reiniciar Grafana
+      systemd:
+        name: grafana-server
+        state: restarted
